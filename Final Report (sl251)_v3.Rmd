@@ -1,0 +1,711 @@
+---
+title: "STAT 420 Final Project"
+subtitle: "Cryptocurrency Market Analysis (2010-2025)"
+author: "Seokhyun Lee (sl251)"
+date: "Dec 3, 2025"
+output:
+  pdf_document:
+    latex_engine: xelatex
+mainfont: "Malgun Gothic"
+geometry: "margin=1in"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 1. Introduction
+
+In this project, I study how Bitcoin’s daily return relates to movements in other financial markets.
+Bitcoin is often described as a “risk-on” asset, but I wanted to see if this idea is supported by a regression model based on real data.
+
+To make the model more appropriate, I work with daily returns instead of price levels. Returns are more stable over time and help avoid strong trends or serial dependence that would violate linear model assumptions.
+
+The response variable is Bitcoin’s daily return (BTC_ret). The predictors are daily returns for Ethereum, Solana, gold, the U.S. Dollar Index (DXY), and the S&P 500, plus weekday and month indicators.
+
+___
+
+# 2. Data Cleaning
+
+The raw data come from stooq.com in CSV format. Each asset has its own file, and formats are not identical.
+I first standardize the date and closing price columns, then compute daily returns and merge everything into a single data frame.
+\[
+\text{Return}_t = \frac{P_t}{P_{t-1}} - 1
+\]
+
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(car)
+library(lmtest)
+library(boot)
+library(ggplot2)
+
+# Function to clean individual CSVs
+clean_data <- function(file) {
+  df <- read_csv(file, show_col_types = FALSE)
+  names(df) <- tolower(names(df))
+
+  # find date and close/price columns
+  date_col  <- grep("date|time", names(df), value = TRUE)[1]
+  close_col <- grep("close|price", names(df), value = TRUE)[1]
+
+  df <- df[, c(date_col, close_col)]
+  names(df) <- c("date", "close")
+
+  df %>%
+    mutate(
+      date  = as.Date(parse_date_time(date, orders = c("ymd","mdy","dmy","Ymd HMS"))),
+      close = as.numeric(gsub(",", "", close))
+    ) %>%
+    arrange(date)
+}
+
+
+# Clean each asset file
+btc  <- clean_data("btcusd_d.csv")
+eth  <- clean_data("eth_v_d.csv")
+sol  <- clean_data("sol_v_d.csv")
+gold <- clean_data("xauusd_d.csv")
+dxy  <- clean_data("dx_c_d.csv")
+spx  <- clean_data("^spx_d.csv")
+
+# Helper to compute returns
+calc_ret <- function(df, prefix) {
+  df %>%
+    arrange(date) %>%
+    mutate(!!paste0(prefix, "_ret") := close / lag(close) - 1) %>%
+    select(date, !!paste0(prefix, "_ret"))
+}
+
+# Compute daily returns
+btc_ret  <- calc_ret(btc,  "BTC")
+eth_ret  <- calc_ret(eth,  "ETH")
+sol_ret  <- calc_ret(sol,  "SOL")
+gold_ret <- calc_ret(gold, "GOLD")
+dxy_ret  <- calc_ret(dxy,  "DXY")
+spx_ret  <- calc_ret(spx,  "SPX")
+
+# Merge and add calendar factors
+dat <- btc_ret %>%
+  left_join(eth_ret,  by = "date") %>%
+  left_join(sol_ret,  by = "date") %>%
+  left_join(gold_ret, by = "date") %>%
+  left_join(dxy_ret,  by = "date") %>%
+  left_join(spx_ret,  by = "date") %>%
+  arrange(date) %>%   
+  
+  { Sys.setlocale("LC_TIME", "C"); . } %>%  
+  mutate(
+    Weekday = factor(weekdays(date),
+                     levels = c("Monday","Tuesday","Wednesday","Thursday","Friday")),
+    Month   = factor(month(date, label = TRUE, abbr = TRUE),
+                     levels = month.abb, ordered = TRUE),
+    WeekdayNum = as.integer(Weekday),
+    MonthNum   = as.integer(Month)
+  )
+
+# save cleaned data
+write_csv(dat, "project_data.csv")
+
+
+# Quick check
+
+summary(dat$date)
+nrow(dat)
+```
+After cleaning and merging, I obtained a long daily time series with consistent dates, numeric closing prices, and derived return variables. For modeling, I use the subset of days with complete information on all predictors, stored in dat_model
+
+```{r}
+summary(dat)
+```
+
+After cleaning and merging, I have a large dataset of complete daily return observations with consistent date, numeric return fields, and factor variables for weekday and month.
+
+### Data Cleaning Explanation:
+The cleaning pipeline makes the raw CSV files comparable across assets. By standardizing the date and closing\‐price columns, converting prices to numeric form, and computing simple daily returns, I avoid problems caused by different file formats or missing values. Merging all assets by date also ensures that each row represents a single trading day across markets, which is essential for running a multiple regression on daily returns.
+
+___
+
+# 3. Exploratory Data Analysis
+
+I first look at basic summary statistics for the main return variables
+```{r}
+summary(select(dat, BTC_ret, ETH_ret, SOL_ret, GOLD_ret, DXY_ret, SPX_ret))
+```
+```{r}
+length(dat$BTC_ret)
+```
+```{r}
+class(dat$BTC_ret)
+```
+
+Bitcoin, Ethereum, and Solana show much wider ranges than gold, DXY, or SPX, which matches the idea that crypto is more volatile.
+
+A histogram of Bitcoin’s return shows heavy tails:
+```{r}
+x <- dat$BTC_ret
+
+# Make sure it's numeric and remove NAs
+x <- as.numeric(x)
+x <- x[!is.na(x)]
+
+cat("BTC_ret length during knit:", length(x), "\n")
+cat("BTC_ret class during knit:", class(x), "\n")
+
+if (length(x) > 0) {
+  hist(
+    x,
+    breaks = 40,
+    main   = "Bitcoin Daily Returns",
+    xlab   = "BTC_ret",
+    col    = "lightblue",
+    border = "white"
+  )
+} else {
+  cat("Skipping histogram: no BTC_ret data available.\n")
+}
+
+```
+### Exploratory Data Analysis Explanation:
+The summary statistics confirm that cryptocurrency returns are much more volatile than traditional assets. BTC, ETH, and SOL have wider ranges and larger interquartile spreads than GOLD, DXY, and SPX, reflecting their higher risk profile. The Bitcoin return histogram is centered near zero but has heavy tails, indicating occasional large gains and crashes that are typical in crypto markets.
+
+The correlation matrix shows a clear structure. BTC_ret is strongly and positively correlated with ETH_ret and SOL_ret, consistent with the idea that major cryptocurrencies tend to move together. BTC_ret is also positively related to SPX_ret, but the relationship is weaker, suggesting that Bitcoin behaves partly like a risk-on equity asset. In contrast, BTC_ret is negatively correlated with DXY_ret, meaning that Bitcoin often falls when the U.S. dollar strengthens. GOLD_ret shows only weak correlations with BTC_ret, implying that Bitcoin does not behave like a traditional safe haven in this period.
+
+Next, I examine correlations between returns:
+```{r}
+ret_cols <- grep("_ret$", names(dat), value = TRUE)
+corr_dat <- dat[, ret_cols, drop = FALSE]
+
+corr_dat <- as.data.frame(lapply(corr_dat, as.numeric))
+corr_dat <- na.omit(corr_dat)
+
+cat("corr_dat rows:", nrow(corr_dat), "cols:", ncol(corr_dat), "\n")
+
+if (nrow(corr_dat) > 1 && ncol(corr_dat) > 1) {
+  cm <- cor(corr_dat, use = "complete.obs")
+  corrplot::corrplot(cm, method = "circle")
+} else {
+  cat("not good.\n")
+}
+```
+Some observations from the EDA:
+
+ - **BTC, ETH, and SOL** are strongly positively correlated.
+ 
+ - **BTC and SPX** returns also move together, but less strongly than BTC and ETH.
+ 
+ - **BTC and DXY** returns are negatively correlated, meaning Bitcoin often moves opposite the dollar.
+ 
+ - **GOLD_ret** has a weaker relationship with **BTC_ret**.
+ 
+These patterns are consistent with common market stories and give expectations for the regression signs.
+
+___
+
+# 4. Model Fitting and Evaluation
+## 4.1 Full Return-Based Model
+
+I start with a full model that includes all return predictors and the calendar variables.
+\[
+\text{BTC\_ret}_t =
+\beta_0
++ \beta_1 \text{ETH\_ret}_t
++ \beta_2 \text{SOL\_ret}_t
++ \beta_3 \text{SPX\_ret}_t
++ \beta_4 \text{DXY\_ret}_t
++ \beta_5 \text{GOLD\_ret}_t
++ \beta_6 \text{WeekdayNum}_t
++ \beta_7 \text{MonthNum}_t
++ \varepsilon_t
+\]
+
+```{r}
+library(readr)
+library(dplyr)
+library(lubridate)
+
+# 1) project_data.csv 
+dat <- read_csv("project_data.csv", show_col_types = FALSE)
+
+# 2) WeekdayNum, MonthNum
+if (!("WeekdayNum" %in% names(dat)) || !("MonthNum" %in% names(dat))) {
+  dat <- dat %>%
+    mutate(
+      Weekday = factor(weekdays(date),
+                       levels = c("Monday","Tuesday","Wednesday","Thursday","Friday")),
+      Month   = factor(month(date, label = TRUE, abbr = TRUE),
+                       levels = month.abb, ordered = TRUE),
+      WeekdayNum = as.integer(Weekday),
+      MonthNum   = as.integer(Month)
+    )
+}
+
+dat_model <- dat %>%
+  dplyr::select(BTC_ret, ETH_ret, SOL_ret, SPX_ret, DXY_ret, GOLD_ret,
+                WeekdayNum, MonthNum) %>%
+  tidyr::drop_na()
+
+cat("Rows used in full model:", nrow(dat_model), "\n")
+
+form_full <- BTC_ret ~ ETH_ret + SOL_ret + SPX_ret + DXY_ret + GOLD_ret +
+  WeekdayNum + MonthNum
+
+fit_full  <- lm(form_full, data = dat_model)
+
+summary(fit_full)
+```
+In this model:
+ - ETH_ret and SPX_ret have positive coefficients.<br>
+ - DXY_ret has a negative coefficient.<br>
+ - SOL_ret and GOLD_ret are less important once ETH and SPX are in the model.<br>
+ - Weekday and month effects are relatively small.<br>
+
+The \(R^2\) is modest, which is normal for daily financial returns.
+
+### Full Return-Based Model Explanation:
+The full regression model uses daily returns on Ethereum, Solana, the S&P 500, the dollar index, and gold, together with simple weekday and month indicators. The estimated coefficients line up well with the exploratory plots: BTC_ret increases with ETH_ret and SPX_ret, and decreases when DXY_ret rises. SOL_ret and GOLD_ret become less important once ETH_ret and SPX_ret are included, suggesting that much of their information is already captured by the main crypto and equity factors. The estimated \(R^2\) is moderate, which is typical for daily return data and indicates that a substantial amount of day-to-day noise remains unexplained.
+
+
+## 4.2 Cross-Validation of the Full Model
+
+The project asks for some cross-validation as a baseline. I use 10-fold CV:
+```{r}
+### 4.2 Cross-Validation of the Full Model
+library(boot)
+
+set.seed(1)
+
+# Refit the same model as a glm with Gaussian errors on the same data as fit_full
+fit_full_glm <- glm(form_full, data = dat_model, family = gaussian())
+
+# 10-fold cross-validation
+cv_full <- cv.glm(dat_model, fit_full_glm, K = 10)
+
+# Report cross-validated MSE (raw and adjusted)
+cv_full$delta
+```
+I used 10-fold cross-validation on the full return-based model by refitting it as a Gaussian GLM and applying cv.glm. The cross-validated mean squared error was approximately 0.00056, very close to the in-sample MSE. This indicates that the model’s out-of-sample performance is consistent with its in-sample fit, although the overall predictive power remains modest, as expected for daily financial return data.
+
+### Cross-Validation Explanation:
+Ten-fold cross-validation on the full model produced an estimated mean squared prediction error of approximately 0.00056 (first element of cv_full$delta). This value is very close to the in-sample MSE from the regression output, suggesting that the model does not severely overfit: its out-of-sample predictive performance is roughly in line with its in-sample fit. At the same time, the magnitude of the MSE confirms that there is substantial irreducible volatility in Bitcoin returns.
+
+## 4.3 Model Diagnostics
+
+I check standard diagnostic plots and measures:
+```{r}
+par(mfrow = c(2,2))
+plot(fit_full)
+
+# Multicollinearity
+
+vif(fit_full)
+
+# Independence
+
+dwtest(fit_full)
+acf(residuals(fit_full))
+```
+### Diagnostic Checks Explanation:
+ - Residuals vs fitted do not show strong curvature, so linearity seems okay.
+ 
+ - The QQ plot shows heavy tails (expected for returns), but most points are near the line.
+ 
+ - The scale–location plot does not show clear heteroscedasticity.
+ 
+ - VIF values are not extremely high, so collinearity is present but manageable.
+ 
+ - The Durbin–Watson statistic is near 2, and the ACF of residuals has no strong pattern, suggesting no serious autocorrelation.
+
+Overall, the full model looks acceptable as a starting point.
+
+___
+
+# 5. Results and Discussion
+
+In this section I interpret the fitted regression models and connect the
+statistical output back to the economic questions about Bitcoin and other
+markets. I focus mainly on the full model and the reduced model, since
+they capture the main structure of the data without unnecessary complexity.
+
+## 5.1 Main Regression Findings
+
+The full regression model uses daily returns on Ethereum, Solana, the S&P 500,
+the dollar index, and gold, together with weekday and month indicators.
+The signs and significance of the estimated coefficients match the patterns
+seen in the exploratory analysis:
+
+- **ETH_ret** has a positive and statistically significant coefficient.  
+  This means that, on days when Ethereum has unusually high returns, Bitcoin
+  also tends to have higher returns, even after controlling for the other
+  predictors. This supports the idea that major cryptocurrencies move together
+  as a “crypto market”.
+
+- **SPX_ret** also enters with a positive and significant coefficient.  
+  Bitcoin tends to rise on days when the U.S. equity market rises. The
+  association is weaker than with ETH_ret, but still clearly positive, which
+  is consistent with the view that Bitcoin behaves like a risk-on asset.
+
+- **DXY_ret** has a negative coefficient.  
+  When the U.S. dollar strengthens (positive DXY_ret), Bitcoin tends to have
+  lower returns. This inverse relationship is often mentioned in macro-crypto
+  commentary and appears clearly in my fitted model.
+
+- **SOL_ret and GOLD_ret** are less important once ETH_ret and SPX_ret are
+  included.  
+  Their coefficients are smaller in magnitude and sometimes not statistically
+  significant. Much of the information in SOL_ret overlaps with ETH_ret, and
+  gold does not behave like a consistently strong hedge for Bitcoin in this
+  sample.
+
+- **Weekday and month indicators** do not show strong or systematic patterns.
+  Any calendar effects are small relative to the day-to-day volatility in
+  returns.
+
+The \(R^2\) values for the full and reduced models are modest, which is normal
+for daily financial return data. The goal of the model is not perfect
+prediction, but rather to quantify how Bitcoin co-moves with other markets.
+
+## 5.2 Full vs. Reduced Model
+
+To simplify the model, I removed SOL_ret and GOLD_ret and refit the regression
+with ETH_ret, SPX_ret, DXY_ret, WeekdayNum, and MonthNum only. Comparing the
+full and reduced models shows that:
+
+- The **fitted values and residual patterns** change very little between the
+  two specifications. ETH_ret, SPX_ret, and DXY_ret carry most of the
+  explanatory power.
+
+- The **ANOVA comparison** and **AIC values** differ only slightly, with a
+  small advantage for the reduced model. This indicates that dropping SOL_ret
+  and GOLD_ret does not materially hurt the fit but makes the model easier to
+  interpret.
+
+- In the reduced model, **ETH_ret, SPX_ret, and DXY_ret** remain clearly
+  significant, reinforcing the conclusion that these three variables are the
+  primary drivers of the linear relationship with BTC_ret.
+
+From a modeling perspective, the reduced model is attractive because it
+achieves essentially the same explanatory power with fewer predictors and
+clearer interpretation.
+
+## 5.3 Practical Interpretation of Effect Sizes
+
+Although the coefficients are estimated in units of daily returns, they have
+a useful economic interpretation:
+
+- The **ETH_ret coefficient** measures how much Bitcoin’s return tends to move
+  when Ethereum moves by one percentage point, holding the other variables
+  fixed. A positive estimate means that rallies or crashes in Ethereum are
+  typically mirrored by Bitcoin.
+
+- The **SPX_ret coefficient** shows how sensitive Bitcoin is to broad stock
+  market moves. A positive coefficient implies that Bitcoin behaves partly
+  like a high-beta equity: it tends to rise on strong stock-market days and
+  fall on weak ones.
+
+- The **DXY_ret coefficient** captures how Bitcoin responds to changes in the
+  strength of the U.S. dollar. A negative estimate means that Bitcoin is more
+  attractive when the dollar weakens, which fits the narrative of Bitcoin as
+  an alternative store of value or speculative asset when traditional currency
+  is under pressure.
+
+Because the overall volatility of BTC_ret is large, even sizable coefficients
+only explain a fraction of the day-to-day variation. The model should be
+viewed as describing **average co-movement patterns**, not providing precise
+forecasts for individual days.
+
+___
+
+# 6. Model Exploration
+
+The instructions recommend trying alternative models (reduced models, interactions, polynomials, etc.).
+In this section I compare a few different specifications.
+
+**FUll Model**
+\[
+\begin{aligned}
+\text{BTC\_ret}_t
+= \,& \beta_0
++ \beta_1\,\text{ETH\_ret}_t
++ \beta_2\,\text{SOL\_ret}_t \\
+&+ \beta_3\,\text{SPX\_ret}_t
++ \beta_4\,\text{DXY\_ret}_t
++ \beta_5\,\text{GOLD\_ret}_t \\
+&+ \beta_6\,\text{WeekdayNum}_t
++ \beta_7\,\text{MonthNum}_t
++ \varepsilon_t
+\end{aligned}
+\]
+
+**Reduced Model** 
+\[
+\begin{aligned}
+\text{BTC\_ret}_t
+= \,& \beta_0
++ \beta_1\,\text{ETH\_ret}_t
++ \beta_2\,\text{SPX\_ret}_t \\
+&+ \beta_3\,\text{DXY\_ret}_t
++ \beta_4\,\text{WeekdayNum}_t
++ \beta_5\,\text{MonthNum}_t
++ \varepsilon_t
+\end{aligned}
+\]
+
+**Interaction Model**
+\[
+\begin{aligned}
+\text{BTC\_ret}_t
+= \,& \beta_0
++ \beta_1\,\text{ETH\_ret}_t
++ \beta_2\,\text{SPX\_ret}_t \\
+&+ \beta_3\,(\text{ETH\_ret}_t \times \text{SPX\_ret}_t)
++ \beta_4\,\text{DXY\_ret}_t \\
+&+ \beta_5\,\text{WeekdayNum}_t
++ \beta_6\,\text{MonthNum}_t
++ \varepsilon_t
+\end{aligned}
+\]
+
+**Polynomial Model**
+\[
+\begin{aligned}
+\text{BTC\_ret}_t
+= \,& \beta_0
++ \beta_1\,\text{ETH\_ret}_t
++ \beta_2\,\text{SPX\_ret}_t  \\
+&+ \beta_3\,\text{SPX\_ret}_t^{\,2}
++ \beta_4\,\text{DXY\_ret}_t \\
+&+ \beta_5\,\text{WeekdayNum}_t
++ \beta_6\,\text{MonthNum}_t
++ \varepsilon_t
+\end{aligned}
+\]
+
+**Lagged Bitcoin Model**
+\[
+\begin{aligned}
+\text{BTC\_ret}_t
+= \,& \beta_0
++ \beta_1\,\text{BTC\_ret}_{t-1} \\
+&+ \beta_2\,\text{ETH\_ret}_t
++ \beta_3\,\text{SPX\_ret}_t
++ \beta_4\,\text{DXY\_ret}_t \\
+&+ \beta_5\,\text{WeekdayNum}_t
++ \beta_6\,\text{MonthNum}_t
++ \varepsilon_t
+\end{aligned}
+\]
+
+**Cross-Validation MSE**
+\[
+\text{CV-MSE}
+= \frac{1}{K}
+\sum_{k=1}^{K}
+\frac{1}{n_k}
+\sum_{i \in \mathcal{F}_k}
+\left( y_i - \hat{y}_{-k,i} \right)^2
+\]
+
+
+
+## 6.1 Reduced Model (Remove Weak Predictors)
+
+First, I remove SOL_ret and GOLD_ret, which seemed less important:
+```{r}
+form_red1 <- BTC_ret ~ ETH_ret + SPX_ret + DXY_ret + WeekdayNum + MonthNum
+fit_red1  <- lm(form_red1, data = dat_model)
+
+anova(fit_red1, fit_full)
+AIC(fit_full, fit_red1)
+```
+
+The ANOVA test and AIC both suggest that the reduced model performs similarly or slightly better than the full one while using fewer predictors.
+
+### Reduced model Explanation : 
+Removing SOL_ret and GOLD_ret barely changes the fitted values or residual variation, but makes the model more compact and easier to interpret. Both the ANOVA test and AIC indicate only a very small loss of fit relative to the full specification, so the reduced model is a reasonable baseline.
+
+## 6.2 Interaction Model
+
+Next, I check whether the interaction between ETH_ret and SPX_ret helps:
+```{r}
+## 6.2 Interaction Model
+form_int1 <- BTC_ret ~ ETH_ret * SPX_ret + DXY_ret + WeekdayNum + MonthNum
+fit_int1  <- lm(form_int1, data = dat_model)
+
+summary(fit_int1)
+AIC(fit_int1, fit_red1)
+```
+The interaction term is not particularly strong, and AIC does not improve compared to the simpler reduced model.
+
+### Interaction model Explanation : 
+The interaction model allows the effect of ETH_ret to depend on SPX_ret. Although the interaction term is statistically significant, the overall model fit, as measured by AIC and cross-validated error, improves only slightly compared with the reduced model. This suggests that the extra complexity adds some nuance but does not fundamentally change the predictive power.
+
+## 6.3 Polynomial Model
+
+I also try a quadratic term for SPX_ret to allow some curvature:
+```{r}
+## 6.3 Polynomial Model
+form_poly1 <- BTC_ret ~ ETH_ret + poly(SPX_ret, 2) + DXY_ret + WeekdayNum + MonthNum
+fit_poly1  <- lm(form_poly1, data = dat_model)
+
+AIC(fit_poly1, fit_red1)
+```
+### Polynomial SPX term explanation: 
+Introducing a quadratic term in SPX_ret lets the model capture potential non-linear responses of Bitcoin to large stock-market moves. However, the AIC and cross-validated MSE are almost identical to those of the reduced model. In practice, the data do not strongly support additional curvature in the SPX effect.
+
+## 6.4 Lagged Bitcoin Return
+
+Finally, I test whether yesterday’s Bitcoin return helps explain today’s return:
+```{r}
+dat$BTC_lag1 <- lag(dat$BTC_ret)
+
+dat_lag <- dat %>% drop_na(BTC_lag1)
+
+form_lag1 <- BTC_ret ~ BTC_lag1 + ETH_ret + SPX_ret + DXY_ret + WeekdayNum + MonthNum
+fit_lag1  <- lm(form_lag1, data = dat_lag)
+
+summary(fit_lag1)
+AIC(fit_lag1, fit_red1)
+```
+The lagged term sometimes shows a small effect, but the overall model fit does not improve enough to justify the extra complexity when compared with the reduced model. AIC is very similar to the reduced model
+
+### Lagged BTC return Exlanation:
+Adding BTC_lag1 checks for short-term momentum or mean-reversion in Bitcoin returns. The coefficient on BTC_lag1 is small and not statistically significant, and the overall fit remains similar to the reduced model. This implies that, at the daily frequency used here, yesterday’s return does not add much predictive power once other market variables are included.
+
+## 6.5 Cross-Validation Comparison
+
+I compare cross-validated errors for the main candidate models:
+```{r}
+## 6.5 Cross-Validation Comparison
+
+# Refit the candidate models as GLMs so cv.glm works consistently
+fit_red1_glm  <- glm(form_red1,  data = dat_model, family = gaussian())
+fit_int1_glm  <- glm(form_int1,  data = dat_model, family = gaussian())
+fit_poly1_glm <- glm(form_poly1, data = dat_model, family = gaussian())
+
+# 10-fold CV for each model
+cv_red1  <- cv.glm(dat_model, fit_red1_glm,  K = 10)
+cv_int1  <- cv.glm(dat_model, fit_int1_glm,  K = 10)
+cv_poly1  <- cv.glm(dat_model, fit_poly1_glm, K = 10)
+
+# Collect the raw cross-validated MSEs (first element of delta)
+cv_results <- c(
+  full        = cv_full$delta[1],
+  reduced     = cv_red1$delta[1],
+  interaction = cv_int1$delta[1],
+  polynomial  = cv_poly1$delta[1]
+)
+
+cv_results
+```
+*Cross-Validation Comparison (Interpretation)*
+Using 10-fold cross-validation, I compared the predictive performance of the four main candidate models. Each model was refit as a Gaussian GLM so that cv.glm behaved consistently. The resulting cross-validated mean squared errors were:
+
+- **Full model:** 0.0005648749
+
+- **Reduced model:** 0.0005671945
+
+- **Interaction model:** 0.0005633010
+
+- **Polynomial model:** 0.0005652706 
+
+All four values are extremely close to one another and to the in-sample MSE, which indicates that no alternative specification provides a meaningful improvement in out-of-sample prediction. The interaction model has the smallest CV error, but the difference is too small to justify additional complexity.
+Overall, the results suggest that the simpler reduced model performs comparably to more complex models while maintaining better interpretability.
+
+### CV comparison Explanation: 
+When I compare cross-validated MSEs across the main candidate models, all values are extremely close. The interaction model achieves the lowest CV error by a tiny margin, but the reduction is much smaller than typical sampling variability for daily returns. Given this, and the goal of keeping the model interpretable, the simpler reduced model is an attractive compromise.
+
+___
+
+# 7. Discussion and Conclusion
+
+```{r}
+summary(fit_red1)
+```
+In this section, I summarize what the **reduced model (fit_red1)** reveals about Bitcoin’s relationships with other financial markets, evaluate model performance, and discuss practical interpretation and limitations.
+
+## 7.1 Main Findings
+
+The analysis examined **how Bitcoin’s daily return** relates to movements in other major financial markets.
+Across all specifications, three variables consistently stood out:
+
+- **ETH_ret** shows a strong, statistically significant positive association with BTC_ret.
+This confirms that major cryptocurrencies tend to move together and that Ethereum returns are an important indicator of broader crypto market sentiment.
+
+- **SPX_ret** also has a positive and meaningful effect.
+Bitcoin tends to increase on days when the U.S. stock market performs well, supporting the interpretation of Bitcoin as a risk-on asset.
+
+- **DXY_ret** has a clear negative effect.
+
+Other variables — such as SOL_ret, GOLD_ret, weekday effects, and month indicators — contribute very little once ETH_ret, SPX_ret, and DXY_ret are included.
+Overall, the model provides a clean and interpretable summary of Bitcoin’s key market linkage
+
+## 7.2 Model Performance and Diagnostics
+
+Model diagnostics confirm that the reduced model fits the data reasonably well:
+
+- **Linearity:** Residual–fitted plots do not display major curvature.
+
+- **Distribution of errors:** The Q–Q plot shows heavy tails (typical for returns), but no extreme deviations from normality.
+
+- **Heteroscedasticity:** The scale–location plot indicates no strong violation of constant variance.
+
+- **Multicollinearity:** VIF values remain well below common thresholds, suggesting manageable correlation among predictors.
+
+- **Autocorrelation:** The Durbin–Watson statistic is near 2, and the ACF of residuals shows no meaningful lag dependence.
+
+Together, these results show that the reduced model is statistically sound and appropriate for describing average relationships in the data, even though daily returns remain noisy.
+
+## 7.3 Comparison with Alternative Models
+
+The reduced model was compared to several alternatives:
+
+- **A full model** including all predictors
+
+- **An interaction model** with ETH_ret × SPX_ret
+
+- **A polynomial model** allowing curvature in SPX_ret
+
+- **A lagged-return model** incorporating BTC_lag1
+
+Even though some terms were statistically significant in the expanded models:
+
+- **Cross-validation errors were nearly identical across all models.**
+
+- **The interaction model had the lowest CV MSE**, but the improvement relative to the reduced model was extremely small — far below the natural volatility of daily returns.
+
+These results indicate that simpler models generalize just as well as more complex ones, making the reduced model a strong baseline for interpretation and communication.
+
+## 7.4 Limitations and Future Directions
+While the reduced model works well as a descriptive tool, several limitations should be acknowledged:
+
+- The model is linear and static, and does not account for time-varying relationships or structural shifts in crypto markets.
+
+- Volatility clustering, which is common in financial returns, is not modeled here.
+
+- Only a limited set of predictors is included. Additional variables — such as interest rates, VIX, or on-chain metrics — may improve predictive accuracy.
+
+- The analysis is correlational, not causal.The model identifies associations, not the mechanisms driving Bitcoin returns.
+
+Future work could incorporate GARCH models, nonlinear methods, or richer macroeconomic datasets to study these dynamics more deeply.
+
+The project set out to explore how Bitcoin responds to movements in other major markets.
+The results support several broad conclusions:
+
+## 7.5 Overall Conclusion
+This project set out to understand how Bitcoin responds to movements in other major markets. Several consistent patterns emerged from the analysis:
+
+- **Bitcoin tends to rise and fall with other risk-on assets**, especially Ethereum and the S&P 500.
+
+- **A stronger U.S. dollar corresponds to weaker Bitcoin returns**, reflecting Bitcoin’s role as an alternative asset.
+
+- **Calendar effects offer little predictive value** and do not improve model performance.
+
+- **Simple linear models perform nearly as well as more complicated alternatives**, both in-sample and out-of-sample.
+
+Despite the inherent volatility and unpredictability of cryptocurrency returns, the regression models reveal stable and interpretable co-movement relationships. These findings align with broader financial market behavior and provide a solid statistical foundation for understanding how Bitcoin interacts with major economic indicators. While the models are not designed for precise daily forecasting, they capture meaningful directional patterns that can inform future economic and financial analyses of cryptocurrency markets.
+
+These findings align with **how financial markets behave in practice** and show that even with modest predictive power, linear regression can still reveal **meaningful relationships between cryptocurrency returns and global market indicators**.
