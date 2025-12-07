@@ -1,4 +1,3 @@
-# Appendix A — Full R Code
 ### STAT 420 Final Project  
 **Author:** Seokhyun (Jason) Lee  
 **UIUC NetID:** sl251  
